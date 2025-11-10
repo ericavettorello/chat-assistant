@@ -1,0 +1,40 @@
+# Переменные окружения
+.env
+.env.local
+.env.*.local
+
+# Виртуальное окружение
+venv/
+env/
+ENV/
+.venv
+
+# Python кэш
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# История диалогов
+chat_history*.json
+chat_history*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# Временные файлы
+*.tmp
+*.temp
+
