@@ -1,59 +1,57 @@
 # -*- coding: utf-8 -*-
-import os
 import sys
 import asyncio
 from pathlib import Path
-from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
-from test_chat import ChatAssistant
+
+# Импортируем модули проекта
+from ai_assistant import ChatAssistant
+from config import (
+    DEFAULT_MODEL,
+    DEFAULT_SYSTEM_MESSAGE,
+    DEFAULT_TEMPERATURE,
+    AVAILABLE_MODELS,
+    TELEGRAM_BOT_KEY,
+    MAX_MESSAGE_LENGTH
+)
+from context_manager import (
+    get_user_assistant,
+    save_user_history_to_txt,
+    get_history_file_path
+)
+from logger import log_error, log_app_event
 
 # Настройка кодировки для Windows консоли
 if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-# Загружаем переменные окружения
-load_dotenv()
 
-# Словарь для хранения ассистентов для каждого пользователя
-user_assistants: dict[int, ChatAssistant] = {}
-
-# Модель по умолчанию
-DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
-DEFAULT_SYSTEM_MESSAGE = "Ты дружелюбный и умный помощник. Отвечай подробно и полезно."
-
-# Доступные модели
-AVAILABLE_MODELS = {
-    "gpt-3.5-turbo": "GPT-3.5 Turbo (быстрая)",
-    "gpt-4o": "GPT-4o (продвинутая)",
-    "gpt-5-pro": "GPT-5 Pro (self-reasoning)",
-    "o1": "O1 (self-reasoning)",
-    "o3": "O3 (self-reasoning)",
-    "claude-sonnet-4-5-20250929": "Claude 4.5 Sonnet (с reasoning)"
-}
-
-
-def get_user_assistant(user_id: int) -> ChatAssistant:
-    """
-    Получает или создает ассистента для пользователя.
-    Каждый пользователь имеет свою историю диалога.
-    """
-    if user_id not in user_assistants:
-        history_file = f"chat_history_{user_id}.json"
-        user_assistants[user_id] = ChatAssistant(
-            model=DEFAULT_MODEL,
-            system_message=DEFAULT_SYSTEM_MESSAGE,
-            history_file=history_file
-        )
-    return user_assistants[user_id]
-
-
-def save_user_history_to_txt(user_id: int):
-    """Автоматически сохраняет историю пользователя в txt файл"""
-    assistant = get_user_assistant(user_id)
-    output_file = f"chat_history_{user_id}.txt"
-    assistant.export_history_to_text(output_file)
+def create_temperature_keyboard(current_temp: float) -> InlineKeyboardMarkup:
+    """Создает клавиатуру для выбора температуры"""
+    temperatures = [
+        (0.0, "детерминированный"),
+        (0.3, "низкая"),
+        (0.7, "средняя"),
+        (1.0, "стандартная"),
+        (1.3, "высокая"),
+        (1.7, "очень высокая"),
+        (2.0, "максимальная")
+    ]
+    
+    keyboard = []
+    for temp, label in temperatures:
+        # Проверяем, является ли это текущей температурой (с учетом погрешности)
+        is_current = abs(temp - current_temp) < 0.01
+        button_text = f"{temp} ({label})"
+        if is_current:
+            button_text += " ✅"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"temp_{temp}")])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Назад в меню", callback_data="back_to_menu")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 
 def create_model_keyboard(current_model: str) -> InlineKeyboardMarkup:
@@ -90,6 +88,9 @@ def create_model_keyboard(current_model: str) -> InlineKeyboardMarkup:
     
     # Дополнительные кнопки
     keyboard.append([
+        InlineKeyboardButton("🌡️ Температура", callback_data="set_temperature")
+    ])
+    keyboard.append([
         InlineKeyboardButton("📥 Скачать историю", callback_data="download_history"),
         InlineKeyboardButton("🗑️ Очистить", callback_data="clear_history")
     ])
@@ -105,12 +106,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start - сразу открывает главное меню"""
     try:
         user_id = update.effective_user.id
+        username = update.effective_user.username or "Unknown"
         assistant = get_user_assistant(user_id)
+        
+        log_app_event("Пользователь запустил бота", {
+            "user_id": user_id,
+            "username": username,
+            "model": assistant.model
+        })
         
         welcome_message = (
             f"👋 Привет, {update.effective_user.first_name}!\n\n"
             f"Я AI-ассистент с поддержкой OpenAI и Claude моделей.\n\n"
             f"📊 Текущая модель: {assistant.model}\n"
+            f"🌡️ Температура: {assistant.temperature}\n"
             f"💬 Просто отправь мне сообщение, и я отвечу!\n\n"
             f"💾 История диалога автоматически сохраняется в txt файл.\n\n"
             f"📋 Управление:\n"
@@ -125,7 +134,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         error_msg = f"❌ Ошибка при запуске: {str(e)}"
         await update.message.reply_text(error_msg)
-        print(f"Ошибка в start: {e}")  # Для отладки
+        log_error(e, context={
+            "handler": "start",
+            "user_id": update.effective_user.id if update.effective_user else None
+        })
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -137,6 +149,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         menu_text = (
             f"📋 Главное меню\n\n"
             f"📊 Текущая модель: {assistant.model}\n"
+            f"🌡️ Температура: {assistant.temperature}\n"
             f"Выберите модель или действие:"
         )
         
@@ -145,7 +158,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         error_msg = f"❌ Ошибка при открытии меню: {str(e)}"
         await update.message.reply_text(error_msg)
-        print(f"Ошибка в menu_command: {e}")  # Для отладки
+        log_error(e, context={
+            "handler": "menu_command",
+            "user_id": update.effective_user.id if update.effective_user else None
+        })
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -163,6 +179,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assistant.model = new_model
         assistant.save_history()
         
+        log_app_event("Пользователь изменил модель", {
+            "user_id": user_id,
+            "old_model": old_model,
+            "new_model": new_model
+        })
+        
         await query.edit_message_text(
             f"✅ Модель изменена:\n"
             f"Было: {old_model}\n"
@@ -174,7 +196,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "download_history":
         # Скачать историю
         save_user_history_to_txt(user_id)
-        output_file = f"chat_history_{user_id}.txt"
+        output_file = get_history_file_path(user_id)
         
         if Path(output_file).exists():
             with open(output_file, 'rb') as f:
@@ -217,6 +239,67 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=create_model_keyboard(assistant.model)
         )
     
+    elif query.data == "set_temperature":
+        # Настройка температуры
+        temp_info = (
+            f"🌡️ Настройка температуры\n\n"
+            f"Текущая температура: {assistant.temperature}\n\n"
+            f"Температура контролирует случайность ответов:\n"
+            f"• 0.0-0.3: Детерминированные, точные ответы\n"
+            f"• 0.7-1.0: Сбалансированные ответы (рекомендуется)\n"
+            f"• 1.3-2.0: Креативные, разнообразные ответы\n\n"
+            f"⚠️ Примечание: Температура работает только для OpenAI моделей.\n"
+            f"Для Claude моделей этот параметр не применяется."
+        )
+        
+        await query.edit_message_text(
+            temp_info,
+            reply_markup=create_temperature_keyboard(assistant.temperature)
+        )
+    
+    elif query.data.startswith("temp_"):
+        # Установка температуры
+        try:
+            new_temp = float(query.data.replace("temp_", ""))
+            old_temp = assistant.temperature
+            assistant.temperature = new_temp
+            assistant.save_history()
+            
+            log_app_event("Пользователь изменил температуру", {
+                "user_id": user_id,
+                "old_temperature": old_temp,
+                "new_temperature": new_temp,
+                "model": assistant.model
+            })
+            
+            await query.edit_message_text(
+                f"✅ Температура изменена:\n"
+                f"Было: {old_temp}\n"
+                f"Стало: {new_temp}\n\n"
+                f"💡 Изменения применятся к следующим запросам.",
+                reply_markup=create_model_keyboard(assistant.model)
+            )
+        except ValueError as e:
+            log_error(e, context={
+                "handler": "temperature_set",
+                "user_id": user_id,
+                "temperature_value": query.data
+            })
+            await query.answer("❌ Ошибка: неверное значение температуры", show_alert=True)
+    
+    elif query.data == "back_to_menu":
+        # Возврат в главное меню
+        menu_text = (
+            f"📋 Главное меню\n\n"
+            f"📊 Текущая модель: {assistant.model}\n"
+            f"🌡️ Температура: {assistant.temperature}\n"
+            f"Выберите модель или действие:"
+        )
+        await query.edit_message_text(
+            menu_text,
+            reply_markup=create_model_keyboard(assistant.model)
+        )
+    
     elif query.data == "close_menu":
         # Закрыть меню
         await query.edit_message_text(
@@ -247,19 +330,20 @@ async def exit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /help"""
     help_text = (
-        "📚 Справка по командам:\n\n"
-        "/start - начать работу с ботом (открывает меню)\n"
-        "/menu - открыть главное меню (выбор модели, скачать историю)\n"
-        "/model - выбрать модель\n"
-        "/clear - очистить историю диалога\n"
-        "/export - скачать историю диалога в txt файл\n"
-        "/exit - информация о выходе из бота\n"
-        "/help - показать эту справку\n\n"
-        "💡 Просто отправь сообщение, и я отвечу с использованием выбранной модели!\n\n"
-        "💾 История автоматически сохраняется в txt файл.\n"
-        "Используй /export или кнопку в меню для скачивания.\n\n"
-        "🚪 Используй /exit для информации о выходе из бота."
-    )
+            "📚 Справка по командам:\n\n"
+            "/start - начать работу с ботом (открывает меню)\n"
+            "/menu - открыть главное меню (выбор модели, скачать историю)\n"
+            "/model - выбрать модель\n"
+            "/temperature - настроить температуру (0.0-2.0)\n"
+            "/clear - очистить историю диалога\n"
+            "/export - скачать историю диалога в txt файл\n"
+            "/exit - информация о выходе из бота\n"
+            "/help - показать эту справку\n\n"
+            "💡 Просто отправь сообщение, и я отвечу с использованием выбранной модели!\n\n"
+            "💾 История автоматически сохраняется в txt файл.\n"
+            "Используй /export или кнопку в меню для скачивания.\n\n"
+            "🚪 Используй /exit для информации о выходе из бота."
+        )
     await update.message.reply_text(help_text)
 
 
@@ -316,7 +400,7 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Обновляем txt файл перед отправкой
     save_user_history_to_txt(user_id)
-    output_file = f"chat_history_{user_id}.txt"
+    output_file = get_history_file_path(user_id)
     
     # Отправляем файл пользователю
     if Path(output_file).exists() and Path(output_file).stat().st_size > 0:
@@ -328,6 +412,52 @@ async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     else:
         await update.message.reply_text("❌ История пуста или произошла ошибка при экспорте")
+
+
+async def temperature_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /temperature для настройки температуры"""
+    user_id = update.effective_user.id
+    assistant = get_user_assistant(user_id)
+    
+    if context.args:
+        try:
+            new_temp = float(context.args[0])
+            if not (0.0 <= new_temp <= 2.0):
+                await update.message.reply_text(
+                    "❌ Ошибка: Температура должна быть в диапазоне от 0.0 до 2.0"
+                )
+                return
+            
+            old_temp = assistant.temperature
+            assistant.temperature = new_temp
+            assistant.save_history()
+            
+            await update.message.reply_text(
+                f"✅ Температура изменена:\n"
+                f"Было: {old_temp}\n"
+                f"Стало: {new_temp}\n\n"
+                f"💡 Изменения применятся к следующим запросам.\n"
+                f"⚠️ Примечание: Температура работает только для OpenAI моделей."
+            )
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Ошибка: Неверный формат температуры.\n"
+                "Использование: /temperature <число от 0.0 до 2.0>\n"
+                "Пример: /temperature 1.0"
+            )
+    else:
+        temp_info = (
+            f"🌡️ Текущая температура: {assistant.temperature}\n\n"
+            f"Температура контролирует случайность ответов:\n"
+            f"• 0.0-0.3: Детерминированные, точные ответы\n"
+            f"• 0.7-1.0: Сбалансированные ответы (рекомендуется)\n"
+            f"• 1.3-2.0: Креативные, разнообразные ответы\n\n"
+            f"Использование: /temperature <число от 0.0 до 2.0>\n"
+            f"Пример: /temperature 1.0\n\n"
+            f"⚠️ Примечание: Температура работает только для OpenAI моделей.\n"
+            f"Для Claude моделей этот параметр не применяется."
+        )
+        await update.message.reply_text(temp_info)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -345,6 +475,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         assistant = get_user_assistant(user_id)
+        
+        # Логируем запрос пользователя
+        log_app_event("Получен запрос от пользователя", {
+            "user_id": user_id,
+            "model": assistant.model,
+            "message_length": len(update.message.text)
+        })
         
         # Получаем ответ от ассистента (используем оригинальный текст, не lower)
         response, metrics = assistant.get_response(update.message.text)
@@ -371,27 +508,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             reply_text += metrics_text
         
+        # Создаем клавиатуру с кнопкой меню
+        menu_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Меню", callback_data="back_to_menu")]
+        ])
+        
         # Отправляем ответ (разбиваем на части, если слишком длинный)
-        if len(reply_text) > 4096:
-            # Telegram ограничивает длину сообщения 4096 символами
-            parts = [reply_text[i:i+4096] for i in range(0, len(reply_text), 4096)]
-            for part in parts:
-                await update.message.reply_text(part)
+        if len(reply_text) > MAX_MESSAGE_LENGTH:
+            # Telegram ограничивает длину сообщения
+            parts = [reply_text[i:i+MAX_MESSAGE_LENGTH] for i in range(0, len(reply_text), MAX_MESSAGE_LENGTH)]
+            # Кнопку меню добавляем только к последнему сообщению
+            for i, part in enumerate(parts):
+                if i == len(parts) - 1:
+                    await update.message.reply_text(part, reply_markup=menu_keyboard)
+                else:
+                    await update.message.reply_text(part)
         else:
-            await update.message.reply_text(reply_text)
+            await update.message.reply_text(reply_text, reply_markup=menu_keyboard)
             
     except Exception as e:
         error_message = f"❌ Ошибка при обработке запроса: {str(e)}"
         await update.message.reply_text(error_message)
+        log_error(e, context={
+            "handler": "handle_message",
+            "user_id": user_id,
+            "model": assistant.model if 'assistant' in locals() else None
+        })
 
 
 def main():
     """Основная функция для запуска бота"""
-    # Получаем токен бота из переменных окружения
-    bot_token = os.getenv("TELEGRAM_BOT_KEY")
+    # Получаем токен бота из конфигурации
+    bot_token = TELEGRAM_BOT_KEY
     
     if not bot_token:
-        print("❌ Ошибка: TELEGRAM_BOT_KEY не найден в .env файле!")
+        error_msg = "❌ Ошибка: TELEGRAM_BOT_KEY не найден в .env файле!"
+        print(error_msg)
+        log_app_event("Ошибка запуска бота", {"reason": "TELEGRAM_BOT_KEY не найден"})
         return
     
     try:
@@ -400,6 +553,7 @@ def main():
             BotCommand("start", "Начать работу с ботом (открывает меню)"),
             BotCommand("menu", "Открыть главное меню"),
             BotCommand("model", "Выбрать модель AI"),
+            BotCommand("temperature", "Настроить температуру (0.0-2.0)"),
             BotCommand("clear", "Очистить историю диалога"),
             BotCommand("export", "Скачать историю диалога"),
             BotCommand("exit", "Информация о выходе из бота"),
@@ -419,6 +573,7 @@ def main():
         application.add_handler(CommandHandler("help", help_command))
         application.add_handler(CommandHandler("menu", menu_command))
         application.add_handler(CommandHandler("model", model_command))
+        application.add_handler(CommandHandler("temperature", temperature_command))
         application.add_handler(CommandHandler("clear", clear_command))
         application.add_handler(CommandHandler("export", export_command))
         application.add_handler(CommandHandler("exit", exit_command))
@@ -433,15 +588,19 @@ def main():
         print("🤖 Telegram бот запущен!")
         print("📋 Команды зарегистрированы в боковой панели")
         print("Нажмите Ctrl+C для остановки")
+        log_app_event("Telegram бот запущен", {"status": "running"})
         application.run_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True  # Игнорируем старые обновления при запуске
         )
     except KeyboardInterrupt:
         print("\n\n🛑 Бот остановлен пользователем")
+        log_app_event("Telegram бот остановлен", {"reason": "KeyboardInterrupt"})
     except Exception as e:
-        print(f"\n❌ Ошибка при работе бота: {str(e)}")
+        error_msg = f"\n❌ Ошибка при работе бота: {str(e)}"
+        print(error_msg)
         print("Убедитесь, что только один экземпляр бота запущен!")
+        log_error(e, context={"handler": "main", "action": "bot_startup"})
 
 
 if __name__ == "__main__":

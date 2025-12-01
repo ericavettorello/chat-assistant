@@ -4,7 +4,6 @@ import sys
 import json
 from datetime import datetime
 from pathlib import Path
-from dotenv import load_dotenv
 from openai import OpenAI
 from anthropic import Anthropic
 from typing import List, Dict, Optional, Union
@@ -14,24 +13,27 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8')
     sys.stderr.reconfigure(encoding='utf-8')
 
-# Загружаем переменные окружения из .env файла
-load_dotenv()
+# Импортируем конфигурацию
+from config import (
+    PROXY_API_KEY,
+    OPENAI_BASE_URL,
+    ANTHROPIC_BASE_URL,
+    PROXY_SUPPORTS_REASONING
+)
+from logger import log_error, log_request
+import time
 
 # Инициализируем клиент OpenAI с прокси-сервером
 openai_client = OpenAI(
-    api_key=os.getenv("ProxyAPI_KEY"),
-    base_url="https://api.proxyapi.ru/openai/v1"
+    api_key=PROXY_API_KEY,
+    base_url=OPENAI_BASE_URL
 )
 
 # Инициализируем клиент Anthropic (Claude) с прокси-сервером
 anthropic_client = Anthropic(
-    api_key=os.getenv("ProxyAPI_KEY"),
-    base_url="https://api.proxyapi.ru/anthropic"
+    api_key=PROXY_API_KEY,
+    base_url=ANTHROPIC_BASE_URL
 )
-
-# Флаг для определения, поддерживает ли прокси-сервер reasoning параметры
-# Прокси-сервер api.proxyapi.ru не поддерживает reasoning_effort для OpenAI
-PROXY_SUPPORTS_REASONING = False
 
 
 class ChatAssistant:
@@ -42,7 +44,7 @@ class ChatAssistant:
     """
     
     def __init__(self, model: str = "gpt-3.5-turbo", system_message: str = "Ты полезный ассистент.", 
-                 history_file: Optional[str] = "chat_history.json"):
+                 history_file: Optional[str] = "chat_history.json", temperature: float = 1.0):
         """
         Инициализация ассистента.
         
@@ -50,9 +52,11 @@ class ChatAssistant:
             model: Модель OpenAI для использования (по умолчанию gpt-3.5-turbo)
             system_message: Системное сообщение для настройки поведения ассистента
             history_file: Путь к файлу для сохранения истории (None - не сохранять в файл)
+            temperature: Температура для генерации ответов (0.0-2.0, по умолчанию 1.0)
         """
         self.model = model
         self.history_file = history_file
+        self.temperature = temperature
         self.messages: List[Dict[str, str]] = [
             {"role": "system", "content": system_message}
         ]
@@ -118,18 +122,27 @@ class ChatAssistant:
                             "content": msg["content"]
                         })
                 
+                # Логируем параметры запроса
+                request_params = {
+                    "model": self.model,
+                    "max_tokens": 4096,
+                    "messages": claude_messages,
+                    "system": system_message if system_message else None
+                }
+                
+                # Засекаем время выполнения запроса
+                start_time = time.time()
+                
                 # Отправляем запрос к Claude API
-                response = anthropic_client.messages.create(
-                    model=self.model,
-                    max_tokens=4096,
-                    messages=claude_messages,
-                    system=system_message if system_message else None
-                )
+                response = anthropic_client.messages.create(**request_params)
+                
+                response_time = time.time() - start_time
                 
                 # Извлекаем ответ
                 assistant_message = response.content[0].text
                 
                 # Извлекаем reasoning метрики, если доступны
+                tokens_info = None
                 if hasattr(response, 'usage') and response.usage:
                     reasoning_metrics = {
                         "input_tokens": getattr(response.usage, 'input_tokens', 0),
@@ -137,18 +150,32 @@ class ChatAssistant:
                         "cache_creation_input_tokens": getattr(response.usage, 'cache_creation_input_tokens', 0),
                         "cache_read_input_tokens": getattr(response.usage, 'cache_read_input_tokens', 0),
                     }
+                    tokens_info = {
+                        "input_tokens": reasoning_metrics["input_tokens"],
+                        "output_tokens": reasoning_metrics["output_tokens"]
+                    }
                 
                 # Проверяем наличие reasoning метрик в response
                 if hasattr(response, 'stop_reason'):
                     reasoning_metrics = reasoning_metrics or {}
                     reasoning_metrics["stop_reason"] = response.stop_reason
                 
+                # Логируем успешный запрос
+                log_request(
+                    service="Anthropic",
+                    model=self.model,
+                    params=request_params,
+                    response_time=response_time,
+                    tokens=tokens_info
+                )
+                
             else:
                 # Работа с OpenAI моделями
                 # Подготавливаем параметры запроса
                 request_params = {
                     "model": self.model,
-                    "messages": self.messages
+                    "messages": self.messages,
+                    "temperature": self.temperature
                 }
                 
                 # Добавляем reasoning_effort для self-reasoning моделей (gpt-5, o-series)
@@ -161,19 +188,39 @@ class ChatAssistant:
                     # Модель все равно будет работать, но без специальных reasoning параметров
                     pass
                 
+                # Засекаем время выполнения запроса
+                start_time = time.time()
+                
                 # Отправляем запрос к API
                 response = openai_client.chat.completions.create(**request_params)
+                
+                response_time = time.time() - start_time
                 
                 # Извлекаем ответ ассистента
                 assistant_message = response.choices[0].message.content
                 
                 # Извлекаем usage метрики
+                tokens_info = None
                 if hasattr(response, 'usage') and response.usage:
                     reasoning_metrics = {
                         "prompt_tokens": getattr(response.usage, 'prompt_tokens', 0),
                         "completion_tokens": getattr(response.usage, 'completion_tokens', 0),
                         "total_tokens": getattr(response.usage, 'total_tokens', 0),
                     }
+                    tokens_info = {
+                        "total_tokens": reasoning_metrics["total_tokens"],
+                        "prompt_tokens": reasoning_metrics["prompt_tokens"],
+                        "completion_tokens": reasoning_metrics["completion_tokens"]
+                    }
+                
+                # Логируем успешный запрос
+                log_request(
+                    service="OpenAI",
+                    model=self.model,
+                    params=request_params,
+                    response_time=response_time,
+                    tokens=tokens_info
+                )
             
             # Добавляем ответ ассистента в историю
             self.add_message("assistant", assistant_message)
@@ -181,6 +228,13 @@ class ChatAssistant:
             return assistant_message, reasoning_metrics
         
         except Exception as e:
+            # Логируем ошибку с контекстом
+            log_error(e, context={
+                "model": self.model,
+                "is_claude": self.is_claude_model(),
+                "temperature": self.temperature,
+                "messages_count": len(self.messages)
+            })
             return f"Ошибка при получении ответа: {str(e)}", None
     
     def clear_history(self, keep_system: bool = True):
@@ -214,6 +268,7 @@ class ChatAssistant:
         try:
             history_data = {
                 "model": self.model,
+                "temperature": self.temperature,
                 "last_updated": datetime.now().isoformat(),
                 "messages": self.messages
             }
@@ -221,6 +276,7 @@ class ChatAssistant:
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(history_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
+            log_error(e, context={"action": "save_history", "file": self.history_file})
             print(f"Ошибка при сохранении истории: {str(e)}")
     
     def load_history(self):
@@ -239,7 +295,11 @@ class ChatAssistant:
                 # Обновляем модель, если она указана в файле
                 if "model" in history_data:
                     self.model = history_data["model"]
+                # Обновляем температуру, если она указана в файле
+                if "temperature" in history_data:
+                    self.temperature = history_data["temperature"]
         except Exception as e:
+            log_error(e, context={"action": "load_history", "file": self.history_file})
             print(f"Ошибка при загрузке истории: {str(e)}")
     
     def export_history_to_text(self, output_file: str = "chat_history.txt"):
@@ -264,6 +324,7 @@ class ChatAssistant:
             
             print(f"История экспортирована в файл: {output_file}")
         except Exception as e:
+            log_error(e, context={"action": "export_history", "file": output_file})
             print(f"Ошибка при экспорте истории: {str(e)}")
 
 
