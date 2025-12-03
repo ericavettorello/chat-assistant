@@ -12,7 +12,9 @@ load_dotenv()
 # Модель по умолчанию
 DEFAULT_MODEL = "claude-sonnet-4-5-20250929"
 DEFAULT_SYSTEM_MESSAGE = "Ты дружелюбный и умный помощник. Отвечай подробно и полезно."
+DEFAULT_SYSTEM_MESSAGE_EN = "You are a friendly and helpful assistant. Answer in detail and be useful."
 DEFAULT_TEMPERATURE = 1.0
+DEFAULT_LANGUAGE = "ru"  # Язык по умолчанию
 
 # Доступные модели
 AVAILABLE_MODELS = {

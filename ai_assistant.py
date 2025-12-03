@@ -258,14 +258,30 @@ class ChatAssistant:
         """
         return self.messages.copy()
     
-    def save_history(self):
+    def save_history(self, language: str = None):
         """
         Сохраняет историю диалога в JSON файл.
+        
+        Args:
+            language: Код языка для сохранения (опционально, если не указан, пытается получить из context_manager)
         """
         if not self.history_file:
             return
         
         try:
+            # Если язык не передан, пытаемся получить его из context_manager по user_id из имени файла
+            if language is None and self.history_file:
+                try:
+                    import re
+                    from context_manager import get_user_language
+                    # Извлекаем user_id из имени файла chat_history_{user_id}.json
+                    match = re.search(r'chat_history_(\d+)\.json', self.history_file)
+                    if match:
+                        user_id = int(match.group(1))
+                        language = get_user_language(user_id)
+                except Exception:
+                    pass  # Если не удалось получить язык, сохраняем без него
+            
             history_data = {
                 "model": self.model,
                 "temperature": self.temperature,
@@ -273,18 +289,26 @@ class ChatAssistant:
                 "messages": self.messages
             }
             
+            # Добавляем язык, если он доступен
+            if language:
+                history_data["language"] = language
+            
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump(history_data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log_error(e, context={"action": "save_history", "file": self.history_file})
             print(f"Ошибка при сохранении истории: {str(e)}")
     
+    
     def load_history(self):
         """
         Загружает историю диалога из JSON файла.
+        
+        Returns:
+            str: Код языка из истории или None
         """
         if not self.history_file or not Path(self.history_file).exists():
-            return
+            return None
         
         try:
             with open(self.history_file, 'r', encoding='utf-8') as f:
@@ -298,9 +322,12 @@ class ChatAssistant:
                 # Обновляем температуру, если она указана в файле
                 if "temperature" in history_data:
                     self.temperature = history_data["temperature"]
+                # Возвращаем язык, если он указан в файле
+                return history_data.get("language")
         except Exception as e:
             log_error(e, context={"action": "load_history", "file": self.history_file})
             print(f"Ошибка при загрузке истории: {str(e)}")
+            return None
     
     def export_history_to_text(self, output_file: str = "chat_history.txt"):
         """

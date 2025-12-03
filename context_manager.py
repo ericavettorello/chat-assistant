@@ -8,7 +8,9 @@ from ai_assistant import ChatAssistant
 from config import (
     DEFAULT_MODEL,
     DEFAULT_SYSTEM_MESSAGE,
+    DEFAULT_SYSTEM_MESSAGE_EN,
     DEFAULT_TEMPERATURE,
+    DEFAULT_LANGUAGE,
     HISTORY_FILE_TEMPLATE,
     TXT_HISTORY_FILE_TEMPLATE,
     OLD_HISTORY_JSON,
@@ -19,8 +21,44 @@ from logger import log_error, log_app_event
 # Словарь для хранения ассистентов для каждого пользователя
 user_assistants: Dict[int, ChatAssistant] = {}
 
+# Словарь для хранения языков пользователей
+user_languages: Dict[int, str] = {}
+
 # Флаг для отслеживания, были ли удалены старые файлы
 _old_files_cleaned = False
+
+
+def get_user_language(user_id: int) -> str:
+    """
+    Получает язык пользователя.
+    
+    Args:
+        user_id: ID пользователя Telegram
+        
+    Returns:
+        str: Код языка (ru/en)
+    """
+    return user_languages.get(user_id, DEFAULT_LANGUAGE)
+
+
+def set_user_language(user_id: int, language: str):
+    """
+    Устанавливает язык пользователя.
+    
+    Args:
+        user_id: ID пользователя Telegram
+        language: Код языка (ru/en)
+    """
+    user_languages[user_id] = language
+    # Обновляем системное сообщение ассистента при смене языка
+    if user_id in user_assistants:
+        assistant = user_assistants[user_id]
+        if language == "en":
+            assistant.messages[0]["content"] = DEFAULT_SYSTEM_MESSAGE_EN
+        else:
+            assistant.messages[0]["content"] = DEFAULT_SYSTEM_MESSAGE
+        # Сохраняем язык в истории
+        assistant.save_history(language=language)
 
 
 def get_user_assistant(user_id: int) -> ChatAssistant:
@@ -36,12 +74,36 @@ def get_user_assistant(user_id: int) -> ChatAssistant:
     """
     if user_id not in user_assistants:
         history_file = HISTORY_FILE_TEMPLATE.format(user_id=user_id)
-        user_assistants[user_id] = ChatAssistant(
+        
+        # Создаем ассистента (load_history вызывается внутри __init__)
+        assistant = ChatAssistant(
             model=DEFAULT_MODEL,
-            system_message=DEFAULT_SYSTEM_MESSAGE,
+            system_message=DEFAULT_SYSTEM_MESSAGE,  # Временное, будет обновлено после загрузки истории
             history_file=history_file,
             temperature=DEFAULT_TEMPERATURE
         )
+        
+        # Загружаем язык из истории, если файл существует
+        # load_history уже был вызван в __init__, но мы можем получить язык из истории напрямую
+        history_path = Path(history_file)
+        if history_path.exists():
+            try:
+                import json
+                with open(history_path, 'r', encoding='utf-8') as f:
+                    history_data = json.load(f)
+                    if "language" in history_data:
+                        user_languages[user_id] = history_data["language"]
+            except Exception:
+                pass  # Если не удалось загрузить, используем язык по умолчанию
+        
+        # Обновляем системное сообщение в зависимости от языка
+        language = get_user_language(user_id)
+        if language == "en":
+            assistant.messages[0]["content"] = DEFAULT_SYSTEM_MESSAGE_EN
+        else:
+            assistant.messages[0]["content"] = DEFAULT_SYSTEM_MESSAGE
+        
+        user_assistants[user_id] = assistant
     return user_assistants[user_id]
 
 
